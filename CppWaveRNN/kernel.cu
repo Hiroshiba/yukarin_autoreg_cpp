@@ -281,30 +281,6 @@ void inference(
 	cudaStream_t stream;
 	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-	cudaStream_t outputCopyStream;
-	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&outputCopyStream, cudaStreamNonBlocking));
-
-	cudaStream_t biasCopyStream;
-	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&biasCopyStream, cudaStreamNonBlocking));
-
-	cudaEvent_t canCopyGruXb, canCopyGruHb, canCopyO1b, canCopyO2b;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyGruXb, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyGruHb, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyO1b, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyO2b, cudaEventDisableTiming));
-
-	cudaEvent_t canGemmGruX, canGemmGruH, canGemmO1, canGemmO2;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmGruX, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmGruH, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmO1, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmO2, cudaEventDisableTiming));
-
-	cudaEvent_t canToKey;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canToKey, cudaEventDisableTiming));
-
-	cudaEvent_t canOutputCopy;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canOutputCopy, cudaEventDisableTiming));
-
 	cublasHandle_t cublasHandle;
 	cublasErrorCheckUtil(cublasCreate(&cublasHandle));
 	cublasErrorCheckUtil(cublasSetStream(cublasHandle, stream));
@@ -372,12 +348,8 @@ void inference(
 			);
 
 		// gru_x = prev_xl.dot(gru_xw) + gru_xb
-		cudaStreamWaitEvent(biasCopyStream, canCopyGruXb, 0);
-		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_x.device, gru_xb_b.device, w_gru_x.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmGruX, biasCopyStream);
-		
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_x.device, gru_xb_b.device, w_gru_x.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		float gemmAlpha = 1, gemmBeta = 1;
-		cudaStreamWaitEvent(stream, canGemmGruX, 0);
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -396,11 +368,7 @@ void inference(
 		));
 
 		// gru_h = hidden.dot(gru_hw) + gru_hb
-		cudaStreamWaitEvent(biasCopyStream, canCopyGruHb, 0);
-		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_h.device, gru_hb_b.device, w_gru_h.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmGruH, biasCopyStream);
-		
-		cudaStreamWaitEvent(stream, canGemmGruH, 0);
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_h.device, gru_hb_b.device, w_gru_h.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -426,15 +394,9 @@ void inference(
 			batch_size,  // int batch_size
 			hidden_size  // int hidden_size
 			);
-		cudaEventRecord(canCopyGruXb, stream);
-		cudaEventRecord(canCopyGruHb, stream);
 
 		// out_x = hidden.dot(O1_W) + O1_b
-		cudaStreamWaitEvent(biasCopyStream, canCopyO1b, 0);
-		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x1.device, O1_b_b.device, w_out_x1.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmO1, biasCopyStream);
-		
-		cudaStreamWaitEvent(stream, canGemmO1, 0);
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x1.device, O1_b_b.device, w_out_x1.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -459,11 +421,7 @@ void inference(
 			);
 
 		// out_x = out_x.dot(O2_W) + O2_b
-		cudaStreamWaitEvent(biasCopyStream, canCopyO2b, 0);
-		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x2.device, O2_b_b.device, w_out_x2.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmO2, biasCopyStream);
-		
-		cudaStreamWaitEvent(stream, canGemmO2, 0);
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x2.device, O2_b_b.device, w_out_x2.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -480,7 +438,6 @@ void inference(
 			w_out_x2.device, // float *C,
 			w_out_x2.shape2 // int ldc
 		));
-		cudaEventRecord(canCopyO1b, stream);
 
 		// softmax
 		auto dist = w_out_x2;
@@ -515,24 +472,17 @@ void inference(
 			stream,  // cudaStream_t stream
 			false  // bool debug_synchronous
 		));
-		cudaEventRecord(canCopyO2b, stream);
 
-		cudaStreamWaitEvent(stream, canToKey, 0);
 		pairToKey KERNEL_ARGS4(dim3(512), dim3(x.size() / 512 + 1), 0, stream) (
 			x.device,  // int *x
 			w_sampled.device,  // cub::KeyValuePair<int, float>* pair
 			x.size()  // int size
 			);
-		cudaEventRecord(canOutputCopy, stream);
 
-		cudaStreamWaitEvent(outputCopyStream, canOutputCopy, 0);
-		cudaMemcpyAsync(&h_pinned_output[i_local * batch_size], x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost, outputCopyStream);
-		cudaEventRecord(canToKey, outputCopyStream);
+		cudaMemcpyAsync(&h_pinned_output[i_local * batch_size], x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost, stream);
 	}
 
 	cudaStreamSynchronize(stream);
-	cudaStreamSynchronize(biasCopyStream);
-	cudaStreamSynchronize(outputCopyStream);
 	end = std::chrono::system_clock::now();
 
 	double time = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000 / 1000;
