@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string>
 #include <iostream>
+#include <chrono>
 
 #include <cuda.h>
 #include <curand.h>
@@ -271,22 +272,40 @@ void inference(
 
 	auto gumbel_random_state = ndarray<curandState>(batch_size, output_size);
 
+	int* h_pinned_output;
+	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_output, length  * batch_size * sizeof(int), cudaHostAllocDefault));
+
 	// create context
 	std::cout << "create context" << std::endl;
 
+	cudaStream_t stream;
+	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+	cudaStream_t outputCopyStream;
+	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&outputCopyStream, cudaStreamNonBlocking));
+
+	cudaEvent_t canToKey;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canToKey, cudaEventDisableTiming));
+	cudaErrorCheckUtil(cudaEventRecord(canToKey));
+
+	cudaEvent_t canOutputCopy;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canOutputCopy, cudaEventDisableTiming));
+
 	cublasHandle_t cublasHandle;
 	cublasErrorCheckUtil(cublasCreate(&cublasHandle));
+	cublasErrorCheckUtil(cublasSetStream(cublasHandle, stream));
 
 	for (int i = 0; i < batch_size; i++) {
 		// broadcast
-		cudaErrorCheckUtil(cudaMemcpy(&gru_xb_b.device[i * gru_xb_b.shape2], gru_xb.device, gru_xb_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice));
-		cudaErrorCheckUtil(cudaMemcpy(&gru_hb_b.device[i * gru_hb_b.shape2], gru_hb.device, gru_hb_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice));
-		cudaErrorCheckUtil(cudaMemcpy(&O1_b_b.device[i * O1_b_b.shape2], O1_b.device, O1_b_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice));
-		cudaErrorCheckUtil(cudaMemcpy(&O2_b_b.device[i * O2_b_b.shape2], O2_b.device, O2_b_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice));
+		cudaErrorCheckUtil(cudaMemcpyAsync(&gru_xb_b.device[i * gru_xb_b.shape2], gru_xb.device, gru_xb_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+		cudaErrorCheckUtil(cudaMemcpyAsync(&gru_hb_b.device[i * gru_hb_b.shape2], gru_hb.device, gru_hb_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+		cudaErrorCheckUtil(cudaMemcpyAsync(&O1_b_b.device[i * O1_b_b.shape2], O1_b.device, O1_b_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+		cudaErrorCheckUtil(cudaMemcpyAsync(&O2_b_b.device[i * O2_b_b.shape2], O2_b.device, O2_b_b.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 	}
 
 	cudnnHandle_t cudnnHandle;
 	cudnnErrorCheckUtil(cudnnCreate(&cudnnHandle));
+	cudnnErrorCheckUtil(cudnnSetStream(cudnnHandle, stream));
 
 	cudnnTensorDescriptor_t softmaxDesc;
 	cudnnErrorCheckUtil(cudnnCreateTensorDescriptor(&softmaxDesc));
@@ -299,7 +318,7 @@ void inference(
 		1,
 		1
 	));
-	initRandomState KERNEL_ARGS2(dim3(512), dim3(gumbel_random_state.size() / 512 + 1)) (
+	initRandomState KERNEL_ARGS4(dim3(512), dim3(gumbel_random_state.size() / 512 + 1), 0, stream) (
 		gumbel_random_state.device,  // curandState *state,
 		gumbel_random_state.size()  // int size
 		);
@@ -324,9 +343,11 @@ void inference(
 	));
 	auto argmax_storage = ndarray<char>((int)argmax_storage_bytes);
 
+	std::chrono::system_clock::time_point start, end;
+	start = std::chrono::system_clock::now();
 	for (int i_local = 0; i_local < length; i_local++) {
 		// concat
-		concat KERNEL_ARGS2(dim3(512), dim3(xl.size() / 512 + 1)) (
+		concat KERNEL_ARGS4(dim3(512), dim3(xl.size() / 512 + 1), 0, stream) (
 			xl.device, // float* xl,
 			x.device, // int* x,
 			&l_array.device[i_local * (l_array.shape2 * l_array.shape3)], // float* l,
@@ -337,7 +358,7 @@ void inference(
 			);
 
 		// gru_x = prev_xl.dot(gru_xw) + gru_xb
-		cudaErrorCheckUtil(cudaMemcpy(w_gru_x.device, gru_xb_b.device, w_gru_x.size() * sizeof(float), cudaMemcpyDeviceToDevice));
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_x.device, gru_xb_b.device, w_gru_x.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		float gemmAlpha = 1, gemmBeta = 1;
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
@@ -357,7 +378,7 @@ void inference(
 		));
 
 		// gru_h = hidden.dot(gru_hw) + gru_hb
-		cudaErrorCheckUtil(cudaMemcpy(w_gru_h.device, gru_hb_b.device, w_gru_h.size() * sizeof(float), cudaMemcpyDeviceToDevice));
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_h.device, gru_hb_b.device, w_gru_h.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -376,7 +397,7 @@ void inference(
 		));
 
 		// gruElementWise
-		gruElementWise KERNEL_ARGS2(dim3(512), dim3(hidden.size() / 512 + 1)) (
+		gruElementWise KERNEL_ARGS4(dim3(512), dim3(hidden.size() / 512 + 1), 0, stream) (
 			hidden.device,  // float* hidden
 			w_gru_x.device,  // float* W
 			w_gru_h.device,  // float* U
@@ -385,7 +406,7 @@ void inference(
 			);
 
 		// out_x = hidden.dot(O1_W) + O1_b
-		cudaErrorCheckUtil(cudaMemcpy(w_out_x1.device, O1_b_b.device, w_out_x1.size() * sizeof(float), cudaMemcpyDeviceToDevice));
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x1.device, O1_b_b.device, w_out_x1.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -404,13 +425,13 @@ void inference(
 		));
 
 		// relu
-		relu KERNEL_ARGS2(dim3(512), dim3(w_out_x1.size() / 512 + 1)) (
+		relu KERNEL_ARGS4(dim3(512), dim3(w_out_x1.size() / 512 + 1), 0, stream) (
 			w_out_x1.device,  // float* x
 			w_out_x1.size()  // int size
 			);
 
 		// out_x = out_x.dot(O2_W) + O2_b
-		cudaErrorCheckUtil(cudaMemcpy(w_out_x2.device, O2_b_b.device, w_out_x2.size() * sizeof(float), cudaMemcpyDeviceToDevice));
+		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x2.device, O2_b_b.device, w_out_x2.size() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -444,11 +465,11 @@ void inference(
 		));
 
 		// sampling
-		//addGumbel KERNEL_ARGS2(dim3(512), dim3(dist.size() / 512 + 1)) (
-		//	dist.device,  // float *x
-		//	gumbel_random_state.device,  // curandState *state
-		//	dist.size()  // int size
-		//	);
+		addGumbel KERNEL_ARGS4(dim3(512), dim3(dist.size() / 512 + 1), 0, stream) (
+			dist.device,  // float *x
+			gumbel_random_state.device,  // curandState *state
+			dist.size()  // int size
+			);
 
 		cudaErrorCheckUtil(cub::DeviceSegmentedReduce::ArgMax(
 			argmax_storage.device,  // void *d_temp_storage
@@ -458,19 +479,31 @@ void inference(
 			dist.shape1,  // int num_segments
 			argmax_offset.device,  // OffsetIteratorT d_begin_offsets
 			argmax_offset.device + 1,  // OffsetIteratorT d_end_offsets
-			0,  // cudaStream_t stream
+			stream,  // cudaStream_t stream
 			false  // bool debug_synchronous
 		));
 
-		pairToKey KERNEL_ARGS2(dim3(512), dim3(x.size() / 512 + 1)) (
+		cudaStreamWaitEvent(stream, canToKey, 0);
+		pairToKey KERNEL_ARGS4(dim3(512), dim3(x.size() / 512 + 1), 0, stream) (
 			x.device,  // int *x
 			w_sampled.device,  // cub::KeyValuePair<int, float>* pair
 			x.size()  // int size
 			);
+		cudaEventRecord(canOutputCopy, stream);
 
-		cudaMemcpy(&h_output[i_local * batch_size], x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost);
+		cudaStreamWaitEvent(outputCopyStream, canOutputCopy, 0);
+		cudaMemcpyAsync(&h_pinned_output[i_local * batch_size], x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost, outputCopyStream);
+		cudaEventRecord(canToKey, outputCopyStream);
 	}
 
+	cudaStreamSynchronize(stream);
+	cudaStreamSynchronize(outputCopyStream);
+	end = std::chrono::system_clock::now();
+
+	double time = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000 / 1000;
+	printf("time %lf[s]\n", time);
+
+	cudaMemcpy(h_output, h_pinned_output, length * batch_size * sizeof(int), cudaMemcpyHostToHost);
 }
 
 //void main() {
