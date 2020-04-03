@@ -308,7 +308,7 @@ void inference(
 		1,
 		1
 	));
-	initRandomState KERNEL_ARGS4(dim3(512), dim3(gumbel_random_state.size() / 512 + 1), 0, stream) (
+	initRandomState KERNEL_ARGS4(dim3(gumbel_random_state.size() / 512 + 1), dim3(512), 0, stream) (
 		gumbel_random_state.device,  // curandState *state,
 		gumbel_random_state.size()  // int size
 		);
@@ -337,7 +337,7 @@ void inference(
 	start = std::chrono::system_clock::now();
 	for (int i_local = 0; i_local < length; i_local++) {
 		// concat
-		concat KERNEL_ARGS4(dim3(512), dim3(xl.size() / 512 + 1), 0, stream) (
+		concat KERNEL_ARGS4(dim3(xl.size() / 512 + 1), dim3(512), 0, stream) (
 			xl.device, // float* xl,
 			x.device, // int* x,
 			&l_array.device[i_local * (l_array.shape2 * l_array.shape3)], // float* l,
@@ -387,7 +387,7 @@ void inference(
 		));
 
 		// gruElementWise
-		gruElementWise KERNEL_ARGS4(dim3(512), dim3(hidden.size() / 512 + 1), 0, stream) (
+		gruElementWise KERNEL_ARGS4(dim3(hidden.size() / 512 + 1), dim3(512), 0, stream) (
 			hidden.device,  // float* hidden
 			w_gru_x.device,  // float* W
 			w_gru_h.device,  // float* U
@@ -415,7 +415,7 @@ void inference(
 		));
 
 		// relu
-		relu KERNEL_ARGS4(dim3(512), dim3(w_out_x1.size() / 512 + 1), 0, stream) (
+		relu KERNEL_ARGS4(dim3(w_out_x1.size() / 512 + 1), dim3(512), 0, stream) (
 			w_out_x1.device,  // float* x
 			w_out_x1.size()  // int size
 			);
@@ -455,7 +455,7 @@ void inference(
 		));
 
 		// sampling
-		addGumbel KERNEL_ARGS4(dim3(512), dim3(dist.size() / 512 + 1), 0, stream) (
+		addGumbel KERNEL_ARGS4(dim3(dist.size() / 512 + 1), dim3(512), 0, stream) (
 			dist.device,  // float *x
 			gumbel_random_state.device,  // curandState *state
 			dist.size()  // int size
@@ -473,7 +473,7 @@ void inference(
 			false  // bool debug_synchronous
 		));
 
-		pairToKey KERNEL_ARGS4(dim3(512), dim3(x.size() / 512 + 1), 0, stream) (
+		pairToKey KERNEL_ARGS4(dim3(x.size() / 512 + 1), dim3(512), 0, stream) (
 			x.device,  // int *x
 			w_sampled.device,  // cub::KeyValuePair<int, float>* pair
 			x.size()  // int size
