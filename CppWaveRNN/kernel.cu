@@ -147,13 +147,8 @@ __global__ void pairToKey(int *x, cub::KeyValuePair<int, float>* pair, int size)
 void cudaErrorCheckUtil(cudaError_t error) {
 	if (error != CUDA_SUCCESS)
 	{
-		throw sprintf(
-			"[Error] %s (error code: %d) at %s line %d\n",
-			cudaGetErrorString(error),
-			error,
-			__FILE__,
-			__LINE__
-		);
+		std::cout << "[Error] " << cudaGetErrorString(error) << "(error code: " << error << ")" << std::endl;
+		throw;
 	}
 }
 
@@ -194,13 +189,8 @@ const char *cublasGetErrorString(cublasStatus_t error)
 void cublasErrorCheckUtil(cublasStatus_t error) {
 	if (error != CUBLAS_STATUS_SUCCESS)
 	{
-		throw sprintf(
-			"[Error] %s (error code: %d) at %s line %d\n",
-			cublasGetErrorString(error),
-			error,
-			__FILE__,
-			__LINE__
-		);
+		std::cout << "[Error] " << cublasGetErrorString(error) << "(error code: " << error << ")" << std::endl;
+		throw;
 	}
 }
 
@@ -208,13 +198,8 @@ void cublasErrorCheckUtil(cublasStatus_t error) {
 void cudnnErrorCheckUtil(cudnnStatus_t error) {
 	if (error != CUBLAS_STATUS_SUCCESS)
 	{
-		throw sprintf(
-			"[Error] %s (error code: %d) at %s line %d\n",
-			cudnnGetErrorString(error),
-			error,
-			__FILE__,
-			__LINE__
-		);
+		std::cout << "[Error] " << cudnnGetErrorString(error) << "(error code: " << error << ")" << std::endl;
+		throw;
 	}
 }
 
@@ -279,13 +264,13 @@ void inference(
 	std::cout << "create context" << std::endl;
 
 	cudaStream_t stream;
-	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&stream, cudaStreamDefault));
 
 	cudaStream_t outputCopyStream;
-	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&outputCopyStream, cudaStreamNonBlocking));
+	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&outputCopyStream, cudaStreamDefault));
 
 	cudaStream_t biasCopyStream;
-	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&biasCopyStream, cudaStreamNonBlocking));
+	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&biasCopyStream, cudaStreamDefault));
 
 	cudaEvent_t canCopyGruXb, canCopyGruHb, canCopyO1b, canCopyO2b;
 	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyGruXb, cudaEventDisableTiming));
@@ -357,8 +342,16 @@ void inference(
 	));
 	auto argmax_storage = ndarray<char>((int)argmax_storage_bytes);
 
-	std::chrono::system_clock::time_point start, end;
-	start = std::chrono::system_clock::now();
+	std::cout << "graph start" << std::endl;
+
+	cudaErrorCheckUtil(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+
+	cudaEventRecord(canCopyGruXb, stream);
+	cudaEventRecord(canCopyGruHb, stream);
+	cudaEventRecord(canCopyO1b, stream);
+	cudaEventRecord(canCopyO2b, stream);
+	cudaEventRecord(canToKey, stream);
+
 	for (int i_local = 0; i_local < length; i_local++) {
 		// concat
 		concat KERNEL_ARGS4(dim3(512), dim3(xl.size() / 512 + 1), 0, stream) (
@@ -530,9 +523,19 @@ void inference(
 		cudaEventRecord(canToKey, outputCopyStream);
 	}
 
-	cudaStreamSynchronize(stream);
-	cudaStreamSynchronize(biasCopyStream);
-	cudaStreamSynchronize(outputCopyStream);
+	cudaStreamWaitEvent(stream, canToKey, 0);  // wait copying
+
+	cudaGraph_t graph;
+	cudaErrorCheckUtil(cudaStreamEndCapture(stream, &graph));
+	std::cout << "graph done" << std::endl;
+
+	cudaGraphExec_t graphExec;
+	cudaErrorCheckUtil(cudaGraphInstantiate(&graphExec, graph, NULL, NULL, 0));
+
+	// launch
+	std::chrono::system_clock::time_point start, end;
+	start = std::chrono::system_clock::now();
+	cudaErrorCheckUtil(cudaGraphLaunch(graphExec, stream));
 	end = std::chrono::system_clock::now();
 
 	double time = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000 / 1000;
