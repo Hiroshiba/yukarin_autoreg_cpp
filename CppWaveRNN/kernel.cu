@@ -266,33 +266,45 @@ void inference(
 	cudaStream_t stream;
 	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&stream, cudaStreamDefault));
 
-	cudaStream_t outputCopyStream;
-	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&outputCopyStream, cudaStreamDefault));
-
 	cudaStream_t biasCopyStream;
 	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&biasCopyStream, cudaStreamDefault));
 
-	cudaEvent_t canCopyGruXb, canCopyGruHb, canCopyO1b, canCopyO2b;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyGruXb, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyGruHb, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyO1b, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canCopyO2b, cudaEventDisableTiming));
+	cudaStream_t hiddenStream;
+	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&hiddenStream, cudaStreamDefault));
 
-	cudaEvent_t canGemmGruX, canGemmGruH, canGemmO1, canGemmO2;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmGruX, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmGruH, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmO1, cudaEventDisableTiming));
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canGemmO2, cudaEventDisableTiming));
+	cudaStream_t outputCopyStream;
+	cudaErrorCheckUtil(cudaStreamCreateWithFlags(&outputCopyStream, cudaStreamDefault));
 
-	cudaEvent_t canToKey;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canToKey, cudaEventDisableTiming));
+	cudaEvent_t elementWiseDone, gemmO2Done, argmaxDone;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&elementWiseDone, cudaEventDisableTiming));
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&gemmO2Done, cudaEventDisableTiming));
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&argmaxDone, cudaEventDisableTiming));
 
-	cudaEvent_t canOutputCopy;
-	cudaErrorCheckUtil(cudaEventCreateWithFlags(&canOutputCopy, cudaEventDisableTiming));
+	cudaEvent_t copyGruXbDone, copyGruHbDone, copyO1bDone, copyO2bDone;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&copyGruXbDone, cudaEventDisableTiming));
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&copyGruHbDone, cudaEventDisableTiming));
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&copyO1bDone, cudaEventDisableTiming));
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&copyO2bDone, cudaEventDisableTiming));
+
+	cudaEvent_t gemmO1Done;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&gemmO1Done, cudaEventDisableTiming));
+
+	cudaEvent_t gemmGruHDone;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&gemmGruHDone, cudaEventDisableTiming));
+
+	cudaEvent_t outputCopyDone;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&outputCopyDone, cudaEventDisableTiming));
+
+	cudaEvent_t toKeyDone;
+	cudaErrorCheckUtil(cudaEventCreateWithFlags(&toKeyDone, cudaEventDisableTiming));
 
 	cublasHandle_t cublasHandle;
 	cublasErrorCheckUtil(cublasCreate(&cublasHandle));
 	cublasErrorCheckUtil(cublasSetStream(cublasHandle, stream));
+
+	cublasHandle_t cublasHiddenHandle;
+	cublasErrorCheckUtil(cublasCreate(&cublasHiddenHandle));
+	cublasErrorCheckUtil(cublasSetStream(cublasHiddenHandle, hiddenStream));
 
 	for (int i = 0; i < batch_size; i++) {
 		// broadcast
@@ -346,11 +358,7 @@ void inference(
 
 	cudaErrorCheckUtil(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
 
-	cudaEventRecord(canCopyGruXb, stream);
-	cudaEventRecord(canCopyGruHb, stream);
-	cudaEventRecord(canCopyO1b, stream);
-	cudaEventRecord(canCopyO2b, stream);
-	cudaEventRecord(canToKey, stream);
+	cudaEventRecord(elementWiseDone, stream);  // for joining
 
 	for (int i_local = 0; i_local < length; i_local++) {
 		// concat
@@ -365,12 +373,12 @@ void inference(
 			);
 
 		// gru_x = prev_xl.dot(gru_xw) + gru_xb
-		cudaStreamWaitEvent(biasCopyStream, canCopyGruXb, 0);
+		cudaStreamWaitEvent(biasCopyStream, elementWiseDone, 0);
 		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_x.device, gru_xb_b.device, w_gru_x.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmGruX, biasCopyStream);
+		cudaEventRecord(copyGruXbDone, biasCopyStream);
 		
 		float gemmAlpha = 1, gemmBeta = 1;
-		cudaStreamWaitEvent(stream, canGemmGruX, 0);
+		cudaStreamWaitEvent(stream, copyGruXbDone, 0);
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -389,13 +397,14 @@ void inference(
 		));
 
 		// gru_h = hidden.dot(gru_hw) + gru_hb
-		cudaStreamWaitEvent(biasCopyStream, canCopyGruHb, 0);
+		cudaStreamWaitEvent(biasCopyStream, elementWiseDone, 0);
 		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_h.device, gru_hb_b.device, w_gru_h.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmGruH, biasCopyStream);
-		
-		cudaStreamWaitEvent(stream, canGemmGruH, 0);
+		cudaEventRecord(copyGruHbDone, biasCopyStream);
+
+		cudaStreamWaitEvent(hiddenStream, copyGruHbDone, 0);
+		cudaStreamWaitEvent(hiddenStream, gemmO1Done, 0);
 		cublasErrorCheckUtil(cublasSgemm(
-			cublasHandle, // cublasHandle_t handle,
+			cublasHiddenHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
 			CUBLAS_OP_N, // cublasOperation_t transb,
 			gru_hw.shape2, // int m,
@@ -410,8 +419,10 @@ void inference(
 			w_gru_h.device, // float *C,
 			w_gru_h.shape2 // int ldc
 		));
+		cudaEventRecord(gemmGruHDone, hiddenStream);
 
 		// gruElementWise
+		cudaStreamWaitEvent(stream, gemmGruHDone, 0);
 		gruElementWise KERNEL_ARGS4(dim3(512), dim3(hidden.size() / 512 + 1), 0, stream) (
 			hidden.device,  // float* hidden
 			w_gru_x.device,  // float* W
@@ -419,15 +430,14 @@ void inference(
 			batch_size,  // int batch_size
 			hidden_size  // int hidden_size
 			);
-		cudaEventRecord(canCopyGruXb, stream);
-		cudaEventRecord(canCopyGruHb, stream);
+		cudaEventRecord(elementWiseDone, stream);
 
 		// out_x = hidden.dot(O1_W) + O1_b
-		cudaStreamWaitEvent(biasCopyStream, canCopyO1b, 0);
+		cudaStreamWaitEvent(biasCopyStream, gemmO2Done, 0);
 		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x1.device, O1_b_b.device, w_out_x1.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmO1, biasCopyStream);
+		cudaEventRecord(copyO1bDone, biasCopyStream);
 		
-		cudaStreamWaitEvent(stream, canGemmO1, 0);
+		cudaStreamWaitEvent(stream, copyO1bDone, 0);
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -444,6 +454,7 @@ void inference(
 			w_out_x1.device, // float *C,
 			w_out_x1.shape2 // int ldc
 		));
+		cudaEventRecord(gemmO1Done, stream);
 
 		// relu
 		relu KERNEL_ARGS4(dim3(512), dim3(w_out_x1.size() / 512 + 1), 0, stream) (
@@ -452,11 +463,11 @@ void inference(
 			);
 
 		// out_x = out_x.dot(O2_W) + O2_b
-		cudaStreamWaitEvent(biasCopyStream, canCopyO2b, 0);
+		cudaStreamWaitEvent(biasCopyStream, argmaxDone, 0);
 		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x2.device, O2_b_b.device, w_out_x2.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-		cudaEventRecord(canGemmO2, biasCopyStream);
+		cudaEventRecord(copyO2bDone, biasCopyStream);
 		
-		cudaStreamWaitEvent(stream, canGemmO2, 0);
+		cudaStreamWaitEvent(stream, copyO2bDone, 0);
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
 			CUBLAS_OP_N, // cublasOperation_t transa,
@@ -473,7 +484,7 @@ void inference(
 			w_out_x2.device, // float *C,
 			w_out_x2.shape2 // int ldc
 		));
-		cudaEventRecord(canCopyO1b, stream);
+		cudaEventRecord(gemmO2Done, stream);
 
 		// softmax
 		auto dist = w_out_x2;
@@ -508,22 +519,22 @@ void inference(
 			stream,  // cudaStream_t stream
 			false  // bool debug_synchronous
 		));
-		cudaEventRecord(canCopyO2b, stream);
+		cudaEventRecord(argmaxDone, stream);
 
-		cudaStreamWaitEvent(stream, canToKey, 0);
+		cudaStreamWaitEvent(stream, outputCopyDone, 0);
 		pairToKey KERNEL_ARGS4(dim3(512), dim3(x.size() / 512 + 1), 0, stream) (
 			x.device,  // int *x
 			w_sampled.device,  // cub::KeyValuePair<int, float>* pair
 			x.size()  // int size
 			);
-		cudaEventRecord(canOutputCopy, stream);
+		cudaEventRecord(toKeyDone, stream);
 
-		cudaStreamWaitEvent(outputCopyStream, canOutputCopy, 0);
+		cudaStreamWaitEvent(outputCopyStream, toKeyDone, 0);
 		cudaMemcpyAsync(&h_pinned_output[i_local * batch_size], x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost, outputCopyStream);
-		cudaEventRecord(canToKey, outputCopyStream);
+		cudaEventRecord(outputCopyDone, outputCopyStream);
 	}
 
-	cudaStreamWaitEvent(stream, canToKey, 0);  // wait copying
+	cudaStreamWaitEvent(stream, outputCopyDone, 0);
 
 	cudaGraph_t graph;
 	cudaErrorCheckUtil(cudaStreamEndCapture(stream, &graph));
