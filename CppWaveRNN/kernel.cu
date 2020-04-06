@@ -205,6 +205,7 @@ void cudnnErrorCheckUtil(cudnnStatus_t error) {
 
 
 void inference(
+	int graph_length,
 	int batch_size,
 	int length,
 	int local_size,
@@ -229,8 +230,14 @@ void inference(
 {
 	// initialize
 	std::cout << "initialize" << std::endl;
+	float* h_pinned_l_array;
+	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_l_array, graph_length  * batch_size * local_size * sizeof(float), cudaHostAllocDefault));
+
+	int* h_pinned_output;
+	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_output, graph_length  * batch_size * sizeof(int), cudaHostAllocDefault));
+
 	auto x = ndarray<int>(batch_size, h_x);
-	auto l_array = ndarray<float>(length, batch_size, local_size, h_l_array);
+	auto l_array = ndarray<float>(graph_length, batch_size, local_size, h_pinned_l_array);
 	auto hidden = ndarray<float>(batch_size, hidden_size, h_hidden);
 
 	auto x_embedder_W = ndarray<float>(output_size, embedding_size, h_x_embedder_W);
@@ -256,9 +263,6 @@ void inference(
 	auto w_sampled = ndarray<cub::KeyValuePair<int, float>>(batch_size);
 
 	auto gumbel_random_state = ndarray<curandState>(batch_size, output_size);
-
-	int* h_pinned_output;
-	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_output, length  * batch_size * sizeof(int), cudaHostAllocDefault));
 
 	// create context
 	std::cout << "create context" << std::endl;
@@ -357,10 +361,11 @@ void inference(
 	std::cout << "graph start" << std::endl;
 
 	cudaErrorCheckUtil(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-
 	cudaEventRecord(elementWiseDone, stream);  // for joining
 
-	for (int i_local = 0; i_local < length; i_local++) {
+	cudaMemcpyAsync(l_array.device, &h_pinned_l_array, l_array.size() * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+	for (int i_local = 0; i_local < graph_length; i_local++) {
 		// concat
 		concat KERNEL_ARGS4(dim3(512), dim3(xl.size() / 512 + 1), 0, stream) (
 			xl.device, // float* xl,
@@ -376,7 +381,7 @@ void inference(
 		cudaStreamWaitEvent(biasCopyStream, elementWiseDone, 0);
 		cudaErrorCheckUtil(cudaMemcpyAsync(w_gru_x.device, gru_xb_b.device, w_gru_x.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
 		cudaEventRecord(copyGruXbDone, biasCopyStream);
-		
+
 		float gemmAlpha = 1, gemmBeta = 1;
 		cudaStreamWaitEvent(stream, copyGruXbDone, 0);
 		cublasErrorCheckUtil(cublasSgemm(
@@ -436,7 +441,7 @@ void inference(
 		cudaStreamWaitEvent(biasCopyStream, gemmO2Done, 0);
 		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x1.device, O1_b_b.device, w_out_x1.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
 		cudaEventRecord(copyO1bDone, biasCopyStream);
-		
+
 		cudaStreamWaitEvent(stream, copyO1bDone, 0);
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
@@ -466,7 +471,7 @@ void inference(
 		cudaStreamWaitEvent(biasCopyStream, argmaxDone, 0);
 		cudaErrorCheckUtil(cudaMemcpyAsync(w_out_x2.device, O2_b_b.device, w_out_x2.size() * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
 		cudaEventRecord(copyO2bDone, biasCopyStream);
-		
+
 		cudaStreamWaitEvent(stream, copyO2bDone, 0);
 		cublasErrorCheckUtil(cublasSgemm(
 			cublasHandle, // cublasHandle_t handle,
@@ -546,13 +551,19 @@ void inference(
 	// launch
 	std::chrono::system_clock::time_point start, end;
 	start = std::chrono::system_clock::now();
-	cudaErrorCheckUtil(cudaGraphLaunch(graphExec, stream));
+
+	for (int i_loop = 0; i_loop < length / graph_length; i_loop++) {
+		cudaMemcpy(h_pinned_l_array, &h_l_array[i_loop * graph_length * batch_size * local_size], graph_length * batch_size * local_size * sizeof(float), cudaMemcpyHostToHost);
+
+		cudaErrorCheckUtil(cudaGraphLaunch(graphExec, stream));
+
+		cudaMemcpy(&h_output[i_loop * graph_length * batch_size], h_pinned_output, graph_length * batch_size * sizeof(int), cudaMemcpyHostToHost);
+	}
 	end = std::chrono::system_clock::now();
 
 	double time = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000 / 1000;
 	printf("time %lf[s]\n", time);
 
-	cudaMemcpy(h_output, h_pinned_output, length * batch_size * sizeof(int), cudaMemcpyHostToHost);
 }
 
 //void main() {

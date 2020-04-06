@@ -1,6 +1,7 @@
 #pragma once
 
 extern "C" __declspec(dllexport) void inference(
+	int graph_length,
 	int batch_size,
 	int length,
 	int local_size,
