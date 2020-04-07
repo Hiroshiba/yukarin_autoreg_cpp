@@ -46,6 +46,8 @@ struct ndarray {
 	int shape1 = 1;
 	int shape2 = 1;
 	int shape3 = 1;
+	ndarray(T* h = NULL) : host(h) {
+	}
 	ndarray(int s1, T* h = NULL) : shape1(s1), host(h) {
 		device = cudaMallocUtil<T>(size(), host);
 	}
@@ -203,20 +205,26 @@ void cudnnErrorCheckUtil(cudnnStatus_t error) {
 	}
 }
 
+auto g_x = ndarray<int>();
+auto g_l_array = ndarray<float>();
+auto g_hidden = ndarray<float>();
 
-void inference(
+int* g_h_pinned_output;
+
+cudaStream_t g_stream;
+
+cudaGraphExec_t g_graphExec;
+
+int g_graph_length;
+
+void initialize(
 	int graph_length,
 	int batch_size,
-	int length,
 	int local_size,
 	int hidden_size,
 	int embedding_size,
 	int linear_hidden_size,
 	int output_size,
-	int* h_output,
-	int* h_x,
-	float* h_l_array,
-	float* h_hidden,
 	float* h_x_embedder_W,
 	float* h_gru_xw,
 	float* h_gru_xb,
@@ -230,15 +238,20 @@ void inference(
 {
 	// initialize
 	std::cout << "initialize" << std::endl;
+	int* h_pinned_x;
+	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_x, batch_size * sizeof(int), cudaHostAllocDefault));
+
 	float* h_pinned_l_array;
 	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_l_array, graph_length  * batch_size * local_size * sizeof(float), cudaHostAllocDefault));
 
-	int* h_pinned_output;
-	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_output, graph_length  * batch_size * sizeof(int), cudaHostAllocDefault));
+	float* h_pinned_hidden;
+	cudaErrorCheckUtil(cudaHostAlloc(&h_pinned_hidden, batch_size * hidden_size * sizeof(float), cudaHostAllocDefault));
 
-	auto x = ndarray<int>(batch_size, h_x);
+	cudaErrorCheckUtil(cudaHostAlloc(&g_h_pinned_output, graph_length  * batch_size * sizeof(int), cudaHostAllocDefault));
+
+	auto x = ndarray<int>(batch_size, h_pinned_x);
 	auto l_array = ndarray<float>(graph_length, batch_size, local_size, h_pinned_l_array);
-	auto hidden = ndarray<float>(batch_size, hidden_size, h_hidden);
+	auto hidden = ndarray<float>(batch_size, hidden_size, h_pinned_hidden);
 
 	auto x_embedder_W = ndarray<float>(output_size, embedding_size, h_x_embedder_W);
 	auto gru_xw = ndarray<float>(embedding_size + local_size, hidden_size * 3, h_gru_xw);
@@ -363,7 +376,9 @@ void inference(
 	cudaErrorCheckUtil(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
 	cudaEventRecord(elementWiseDone, stream);  // for joining
 
-	cudaMemcpyAsync(l_array.device, &h_pinned_l_array, l_array.size() * sizeof(float), cudaMemcpyHostToDevice, stream);
+	cudaErrorCheckUtil(cudaMemcpyAsync(x.device, x.host, x.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+	cudaErrorCheckUtil(cudaMemcpyAsync(l_array.device, l_array.host, l_array.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+	cudaErrorCheckUtil(cudaMemcpyAsync(hidden.device, hidden.host, hidden.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
 
 	for (int i_local = 0; i_local < graph_length; i_local++) {
 		// concat
@@ -535,9 +550,12 @@ void inference(
 		cudaEventRecord(toKeyDone, stream);
 
 		cudaStreamWaitEvent(outputCopyStream, toKeyDone, 0);
-		cudaMemcpyAsync(&h_pinned_output[i_local * batch_size], x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost, outputCopyStream);
+		cudaMemcpyAsync(&g_h_pinned_output[i_local * batch_size], x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost, outputCopyStream);
 		cudaEventRecord(outputCopyDone, outputCopyStream);
 	}
+
+	cudaMemcpyAsync(x.host, x.device, x.size() * sizeof(int), cudaMemcpyDeviceToHost, stream);
+	cudaMemcpyAsync(hidden.host, hidden.device, hidden.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
 
 	cudaStreamWaitEvent(stream, outputCopyDone, 0);
 
@@ -545,27 +563,53 @@ void inference(
 	cudaErrorCheckUtil(cudaStreamEndCapture(stream, &graph));
 	std::cout << "graph done" << std::endl;
 
-	cudaGraphExec_t graphExec;
-	cudaErrorCheckUtil(cudaGraphInstantiate(&graphExec, graph, NULL, NULL, 0));
+	cudaErrorCheckUtil(cudaGraphInstantiate(&g_graphExec, graph, NULL, NULL, 0));
 
+	// destroy
+	cudaErrorCheckUtil(cudaStreamDestroy(biasCopyStream));
+	cudaErrorCheckUtil(cudaStreamDestroy(hiddenStream));
+	cudaErrorCheckUtil(cudaStreamDestroy(outputCopyStream));
+
+	// global parameters
+	g_x = x;
+	g_l_array = l_array;
+	g_hidden = hidden;
+
+	g_stream = stream;
+
+	g_graph_length = graph_length;
+}
+
+
+void inference(
+	int batch_size,
+	int length,
+	int* h_output,
+	int* h_x,
+	float* h_l_array,
+	float* h_hidden
+)
+{
 	// launch
 	std::chrono::system_clock::time_point start, end;
 	start = std::chrono::system_clock::now();
 
-	for (int i_loop = 0; i_loop < length / graph_length; i_loop++) {
-		cudaMemcpy(h_pinned_l_array, &h_l_array[i_loop * graph_length * batch_size * local_size], graph_length * batch_size * local_size * sizeof(float), cudaMemcpyHostToHost);
+	cudaErrorCheckUtil(cudaMemcpy(g_x.host, h_x, g_x.size() * sizeof(int), cudaMemcpyHostToHost));
+	cudaErrorCheckUtil(cudaMemcpy(g_hidden.host, h_hidden, g_hidden.size() * sizeof(float), cudaMemcpyHostToHost));
 
-		cudaErrorCheckUtil(cudaGraphLaunch(graphExec, stream));
+	for (int i_loop = 0; i_loop < length / g_graph_length; i_loop++) {
+		cudaMemcpy(g_l_array.host, &h_l_array[i_loop * g_l_array.size()], g_l_array.size() * sizeof(float), cudaMemcpyHostToHost);
 
-		cudaMemcpy(&h_output[i_loop * graph_length * batch_size], h_pinned_output, graph_length * batch_size * sizeof(int), cudaMemcpyHostToHost);
+		cudaErrorCheckUtil(cudaGraphLaunch(g_graphExec, g_stream));
+
+		cudaMemcpy(&h_output[i_loop * g_graph_length * batch_size], g_h_pinned_output, g_graph_length * batch_size * sizeof(int), cudaMemcpyHostToHost);
 	}
+
+	cudaErrorCheckUtil(cudaMemcpy(h_x, g_x.host, g_x.size() * sizeof(int), cudaMemcpyHostToHost));
+	cudaErrorCheckUtil(cudaMemcpy(h_hidden, g_hidden.host, g_hidden.size() * sizeof(float), cudaMemcpyHostToHost));
+
 	end = std::chrono::system_clock::now();
 
 	double time = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000 / 1000;
 	printf("time %lf[s]\n", time);
-
 }
-
-//void main() {
-//	inference(NULL);
-//}
