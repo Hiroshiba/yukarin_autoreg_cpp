@@ -2,7 +2,7 @@
 
 extern "C" __declspec(dllexport) void initialize(
 	int graph_length,
-	int batch_size,
+	int max_batch_size,
 	int local_size,
 	int hidden_size,
 	int embedding_size,
