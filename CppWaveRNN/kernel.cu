@@ -63,54 +63,6 @@ static const char *_cudaGetErrorEnum(cublasStatus_t error) {
 }
 #endif
 
-#ifdef CURAND_H_
-// cuRAND API errors
-static const char *_cudaGetErrorEnum(curandStatus_t error) {
-	switch (error) {
-	case CURAND_STATUS_SUCCESS:
-		return "CURAND_STATUS_SUCCESS";
-
-	case CURAND_STATUS_VERSION_MISMATCH:
-		return "CURAND_STATUS_VERSION_MISMATCH";
-
-	case CURAND_STATUS_NOT_INITIALIZED:
-		return "CURAND_STATUS_NOT_INITIALIZED";
-
-	case CURAND_STATUS_ALLOCATION_FAILED:
-		return "CURAND_STATUS_ALLOCATION_FAILED";
-
-	case CURAND_STATUS_TYPE_ERROR:
-		return "CURAND_STATUS_TYPE_ERROR";
-
-	case CURAND_STATUS_OUT_OF_RANGE:
-		return "CURAND_STATUS_OUT_OF_RANGE";
-
-	case CURAND_STATUS_LENGTH_NOT_MULTIPLE:
-		return "CURAND_STATUS_LENGTH_NOT_MULTIPLE";
-
-	case CURAND_STATUS_DOUBLE_PRECISION_REQUIRED:
-		return "CURAND_STATUS_DOUBLE_PRECISION_REQUIRED";
-
-	case CURAND_STATUS_LAUNCH_FAILURE:
-		return "CURAND_STATUS_LAUNCH_FAILURE";
-
-	case CURAND_STATUS_PREEXISTING_FAILURE:
-		return "CURAND_STATUS_PREEXISTING_FAILURE";
-
-	case CURAND_STATUS_INITIALIZATION_FAILED:
-		return "CURAND_STATUS_INITIALIZATION_FAILED";
-
-	case CURAND_STATUS_ARCH_MISMATCH:
-		return "CURAND_STATUS_ARCH_MISMATCH";
-
-	case CURAND_STATUS_INTERNAL_ERROR:
-		return "CURAND_STATUS_INTERNAL_ERROR";
-	}
-
-	return "<unknown>";
-}
-#endif
-
 #ifdef CUDNN_H_
 // cuDNN API errors
 static const char *_cudaGetErrorEnum(cudnnStatus_t error) {
@@ -260,6 +212,7 @@ __global__ void pairToKey(int *x, cub::KeyValuePair<int, float>* pair, int size)
 	x[i] = pair[i].key;
 }
 
+
 auto g_x = ndarray<int>();
 auto g_l_array = ndarray<float>();
 auto g_hidden = ndarray<float>();
@@ -268,14 +221,12 @@ int* g_h_pinned_output;
 
 cudaStream_t g_stream;
 
-cudaGraphExec_t* g_graphExec;
+cudaGraphExec_t g_graphExec;
 
-int* g_graph_lengths;
-int g_graph_length_num;
+int g_graph_length;
 
 void initialize(
-	int* graph_lengths, // should be descending
-	int graph_length_num,
+	int graph_length,
 	int max_batch_size,
 	int local_size,
 	int hidden_size,
@@ -294,22 +245,20 @@ void initialize(
 )
 {
 	// initialize
-	int max_graph_length = graph_lengths[0];
-
 	std::cout << "initialize" << std::endl;
 	int* h_pinned_x;
 	checkCudaErrors(cudaHostAlloc(&h_pinned_x, max_batch_size * sizeof(int), cudaHostAllocDefault));
 
 	float* h_pinned_l_array;
-	checkCudaErrors(cudaHostAlloc(&h_pinned_l_array, max_graph_length  * max_batch_size * local_size * sizeof(float), cudaHostAllocDefault));
+	checkCudaErrors(cudaHostAlloc(&h_pinned_l_array, graph_length  * max_batch_size * local_size * sizeof(float), cudaHostAllocDefault));
 
 	float* h_pinned_hidden;
 	checkCudaErrors(cudaHostAlloc(&h_pinned_hidden, max_batch_size * hidden_size * sizeof(float), cudaHostAllocDefault));
 
-	checkCudaErrors(cudaHostAlloc(&g_h_pinned_output, max_graph_length  * max_batch_size * sizeof(int), cudaHostAllocDefault));
+	checkCudaErrors(cudaHostAlloc(&g_h_pinned_output, graph_length  * max_batch_size * sizeof(int), cudaHostAllocDefault));
 
 	auto x = ndarray<int>(max_batch_size, h_pinned_x);
-	auto l_array = ndarray<float>(max_graph_length, max_batch_size, local_size, h_pinned_l_array);
+	auto l_array = ndarray<float>(graph_length, max_batch_size, local_size, h_pinned_l_array);
 	auto hidden = ndarray<float>(max_batch_size, hidden_size, h_pinned_hidden);
 
 	auto x_embedder_W = ndarray<float>(output_size, embedding_size, h_x_embedder_W);
@@ -397,257 +346,254 @@ void initialize(
 	auto argmax_storage = ndarray<char>((int)argmax_storage_bytes);
 
 	// graph
-	g_graphExec = (cudaGraphExec_t*)malloc(max_batch_size * graph_length_num * sizeof(cudaGraphExec_t));
+	cudaEvent_t copyHiddenDone;
+	checkCudaErrors(cudaEventCreateWithFlags(&copyHiddenDone, cudaEventDisableTiming));
 
-	for (int batch_size = max_batch_size; batch_size >= 1; batch_size--) {
-		for (int i_graph_length = 0; i_graph_length < graph_length_num; i_graph_length++) {
-			int graph_length = graph_lengths[i_graph_length];
+	cudaEvent_t elementWiseDone, gemmO2Done, argmaxDone;
+	checkCudaErrors(cudaEventCreateWithFlags(&elementWiseDone, cudaEventDisableTiming));
+	checkCudaErrors(cudaEventCreateWithFlags(&gemmO2Done, cudaEventDisableTiming));
+	checkCudaErrors(cudaEventCreateWithFlags(&argmaxDone, cudaEventDisableTiming));
 
-			cudaEvent_t elementWiseDone, gemmO2Done, argmaxDone;
-			checkCudaErrors(cudaEventCreateWithFlags(&elementWiseDone, cudaEventDisableTiming));
-			checkCudaErrors(cudaEventCreateWithFlags(&gemmO2Done, cudaEventDisableTiming));
-			checkCudaErrors(cudaEventCreateWithFlags(&argmaxDone, cudaEventDisableTiming));
+	cudaEvent_t copyGruXbDone, copyGruHbDone, copyO1bDone, copyO2bDone;
+	checkCudaErrors(cudaEventCreateWithFlags(&copyGruXbDone, cudaEventDisableTiming));
+	checkCudaErrors(cudaEventCreateWithFlags(&copyGruHbDone, cudaEventDisableTiming));
+	checkCudaErrors(cudaEventCreateWithFlags(&copyO1bDone, cudaEventDisableTiming));
+	checkCudaErrors(cudaEventCreateWithFlags(&copyO2bDone, cudaEventDisableTiming));
 
-			cudaEvent_t copyGruXbDone, copyGruHbDone, copyO1bDone, copyO2bDone;
-			checkCudaErrors(cudaEventCreateWithFlags(&copyGruXbDone, cudaEventDisableTiming));
-			checkCudaErrors(cudaEventCreateWithFlags(&copyGruHbDone, cudaEventDisableTiming));
-			checkCudaErrors(cudaEventCreateWithFlags(&copyO1bDone, cudaEventDisableTiming));
-			checkCudaErrors(cudaEventCreateWithFlags(&copyO2bDone, cudaEventDisableTiming));
+	cudaEvent_t gemmO1Done;
+	checkCudaErrors(cudaEventCreateWithFlags(&gemmO1Done, cudaEventDisableTiming));
 
-			cudaEvent_t gemmO1Done;
-			checkCudaErrors(cudaEventCreateWithFlags(&gemmO1Done, cudaEventDisableTiming));
+	cudaEvent_t gemmGruHDone;
+	checkCudaErrors(cudaEventCreateWithFlags(&gemmGruHDone, cudaEventDisableTiming));
 
-			cudaEvent_t gemmGruHDone;
-			checkCudaErrors(cudaEventCreateWithFlags(&gemmGruHDone, cudaEventDisableTiming));
+	cudaEvent_t outputCopyDone;
+	checkCudaErrors(cudaEventCreateWithFlags(&outputCopyDone, cudaEventDisableTiming));
 
-			cudaEvent_t outputCopyDone;
-			checkCudaErrors(cudaEventCreateWithFlags(&outputCopyDone, cudaEventDisableTiming));
+	cudaEvent_t toKeyDone;
+	checkCudaErrors(cudaEventCreateWithFlags(&toKeyDone, cudaEventDisableTiming));
 
-			cudaEvent_t toKeyDone;
-			checkCudaErrors(cudaEventCreateWithFlags(&toKeyDone, cudaEventDisableTiming));
+	cudnnTensorDescriptor_t softmaxDesc;
+	checkCudaErrors(cudnnCreateTensorDescriptor(&softmaxDesc));
+	checkCudaErrors(cudnnSetTensor4dDescriptor(
+		softmaxDesc,
+		CUDNN_TENSOR_NCHW,
+		CUDNN_DATA_FLOAT,
+		max_batch_size,
+		w_out_x2.shape2,
+		1,
+		1
+	));
 
-			cudnnTensorDescriptor_t softmaxDesc;
-			checkCudaErrors(cudnnCreateTensorDescriptor(&softmaxDesc));
-			checkCudaErrors(cudnnSetTensor4dDescriptor(
-				softmaxDesc,
-				CUDNN_TENSOR_NCHW,
-				CUDNN_DATA_FLOAT,
-				batch_size,
-				w_out_x2.shape2,
-				1,
-				1
-			));
+	std::cout << "graph start" << std::endl;
 
-			std::cout << "graph start " << batch_size << std::endl;
+	checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+	cudaEventRecord(elementWiseDone, stream);  // for joining
 
-			checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-			cudaEventRecord(elementWiseDone, stream);  // for joining
+	checkCudaErrors(cudaMemcpyAsync(x.device, x.host, max_batch_size * sizeof(int), cudaMemcpyHostToDevice, stream));
+	checkCudaErrors(cudaMemcpyAsync(l_array.device, l_array.host, l_array.shape1 * max_batch_size * l_array.shape3 * sizeof(float), cudaMemcpyHostToDevice, stream));
+	checkCudaErrors(cudaMemcpyAsync(hidden.device, hidden.host, max_batch_size * hidden.shape2 * sizeof(float), cudaMemcpyHostToDevice, stream));
+	cudaEventRecord(copyHiddenDone, stream);
+	cudaStreamWaitEvent(hiddenStream, copyHiddenDone, 0);
 
-			checkCudaErrors(cudaMemcpyAsync(x.device, x.host, batch_size * sizeof(int), cudaMemcpyHostToDevice, stream));
-			checkCudaErrors(cudaMemcpyAsync(l_array.device, l_array.host, l_array.shape1 * batch_size * l_array.shape3 * sizeof(float), cudaMemcpyHostToDevice, stream));
-			checkCudaErrors(cudaMemcpyAsync(hidden.device, hidden.host, batch_size * hidden.shape2 * sizeof(float), cudaMemcpyHostToDevice, stream));
+	for (int i_local = 0; i_local < graph_length; i_local++) {
+		// concat
+		concat KERNEL_ARGS4(dim3(512), dim3(max_batch_size * xl.shape2 / 512 + 1), 0, stream) (
+			xl.device, // float* xl,
+			x.device, // int* x,
+			&l_array.device[i_local * (max_batch_size * l_array.shape3)], // float* l,
+			x_embedder_W.device, // float* x_embedder_W,
+			max_batch_size, // int batch_size,
+			local_size, // int local_size,
+			embedding_size // int embedding_size
+			);
 
-			for (int i_local = 0; i_local < graph_length; i_local++) {
-				// concat
-				concat KERNEL_ARGS4(dim3(512), dim3(batch_size * xl.shape2 / 512 + 1), 0, stream) (
-					xl.device, // float* xl,
-					x.device, // int* x,
-					&l_array.device[i_local * (batch_size * l_array.shape3)], // float* l,
-					x_embedder_W.device, // float* x_embedder_W,
-					batch_size, // int batch_size,
-					local_size, // int local_size,
-					embedding_size // int embedding_size
-					);
+		// gru_x = prev_xl.dot(gru_xw) + gru_xb
+		cudaStreamWaitEvent(biasCopyStream, elementWiseDone, 0);
+		checkCudaErrors(cudaMemcpyAsync(w_gru_x.device, gru_xb_b.device, max_batch_size * w_gru_x.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
+		cudaEventRecord(copyGruXbDone, biasCopyStream);
 
-				// gru_x = prev_xl.dot(gru_xw) + gru_xb
-				cudaStreamWaitEvent(biasCopyStream, elementWiseDone, 0);
-				checkCudaErrors(cudaMemcpyAsync(w_gru_x.device, gru_xb_b.device, batch_size * w_gru_x.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-				cudaEventRecord(copyGruXbDone, biasCopyStream);
+		float gemmAlpha = 1, gemmBeta = 1;
+		cudaStreamWaitEvent(stream, copyGruXbDone, 0);
+		checkCudaErrors(cublasSgemm(
+			cublasHandle, // cublasHandle_t handle,
+			CUBLAS_OP_N, // cublasOperation_t transa,
+			CUBLAS_OP_N, // cublasOperation_t transb,
+			gru_xw.shape2, // int m,
+			max_batch_size, // int n,
+			gru_xw.shape1, // int k,
+			&gemmAlpha, // const float *alpha, /* host or device pointer */
+			gru_xw.device, // const float *A,
+			gru_xw.shape2, // int lda,
+			xl.device, // const float *B,
+			xl.shape2, // int ldb,
+			&gemmBeta, // const float *beta, /* host or device pointer */
+			w_gru_x.device, // float *C,
+			w_gru_x.shape2 // int ldc
+		));
 
-				float gemmAlpha = 1, gemmBeta = 1;
-				cudaStreamWaitEvent(stream, copyGruXbDone, 0);
-				checkCudaErrors(cublasSgemm(
-					cublasHandle, // cublasHandle_t handle,
-					CUBLAS_OP_N, // cublasOperation_t transa,
-					CUBLAS_OP_N, // cublasOperation_t transb,
-					gru_xw.shape2, // int m,
-					batch_size, // int n,
-					gru_xw.shape1, // int k,
-					&gemmAlpha, // const float *alpha, /* host or device pointer */
-					gru_xw.device, // const float *A,
-					gru_xw.shape2, // int lda,
-					xl.device, // const float *B,
-					xl.shape2, // int ldb,
-					&gemmBeta, // const float *beta, /* host or device pointer */
-					w_gru_x.device, // float *C,
-					w_gru_x.shape2 // int ldc
-				));
+		// gru_h = hidden.dot(gru_hw) + gru_hb
+		checkCudaErrors(cudaStreamWaitEvent(biasCopyStream, elementWiseDone, 0));
+		checkCudaErrors(cudaMemcpyAsync(w_gru_h.device, gru_hb_b.device, max_batch_size * w_gru_h.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
+		checkCudaErrors(cudaEventRecord(copyGruHbDone, biasCopyStream));
 
-				// gru_h = hidden.dot(gru_hw) + gru_hb
-				checkCudaErrors(cudaStreamWaitEvent(biasCopyStream, elementWiseDone, 0));
-				checkCudaErrors(cudaMemcpyAsync(w_gru_h.device, gru_hb_b.device, batch_size * w_gru_h.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-				checkCudaErrors(cudaEventRecord(copyGruHbDone, biasCopyStream));
+		checkCudaErrors(cudaStreamWaitEvent(hiddenStream, copyGruHbDone, 0));
+		checkCudaErrors(cudaStreamWaitEvent(hiddenStream, gemmO1Done, 0));
+		checkCudaErrors(cublasSgemm(
+			cublasHiddenHandle, // cublasHandle_t handle,
+			CUBLAS_OP_N, // cublasOperation_t transa,
+			CUBLAS_OP_N, // cublasOperation_t transb,
+			gru_hw.shape2, // int m,
+			max_batch_size, // int n,
+			gru_hw.shape1, // int k,
+			&gemmAlpha, // const float *alpha, /* host or device pointer */
+			gru_hw.device, // const float *A,
+			gru_hw.shape2, // int lda,
+			hidden.device, // const float *B,
+			hidden.shape2, // int ldb,
+			&gemmBeta, // const float *beta, /* host or device pointer */
+			w_gru_h.device, // float *C,
+			w_gru_h.shape2 // int ldc
+		));
+		checkCudaErrors(cudaEventRecord(gemmGruHDone, hiddenStream));
 
-				checkCudaErrors(cudaStreamWaitEvent(hiddenStream, copyGruHbDone, 0));
-				checkCudaErrors(cudaStreamWaitEvent(hiddenStream, gemmO1Done, 0));
-				checkCudaErrors(cublasSgemm(
-					cublasHiddenHandle, // cublasHandle_t handle,
-					CUBLAS_OP_N, // cublasOperation_t transa,
-					CUBLAS_OP_N, // cublasOperation_t transb,
-					gru_hw.shape2, // int m,
-					batch_size, // int n,
-					gru_hw.shape1, // int k,
-					&gemmAlpha, // const float *alpha, /* host or device pointer */
-					gru_hw.device, // const float *A,
-					gru_hw.shape2, // int lda,
-					hidden.device, // const float *B,
-					hidden.shape2, // int ldb,
-					&gemmBeta, // const float *beta, /* host or device pointer */
-					w_gru_h.device, // float *C,
-					w_gru_h.shape2 // int ldc
-				));
-				checkCudaErrors(cudaEventRecord(gemmGruHDone, hiddenStream));
+		// gruElementWise
+		cudaStreamWaitEvent(stream, gemmGruHDone, 0);
+		gruElementWise KERNEL_ARGS4(dim3(max_batch_size * hidden.shape2 / 512 + 1), dim3(512), 0, stream) (
+			hidden.device,  // float* hidden
+			w_gru_x.device,  // float* W
+			w_gru_h.device,  // float* U
+			max_batch_size,  // int batch_size
+			hidden_size  // int hidden_size
+			);
+		cudaEventRecord(elementWiseDone, stream);
 
-				// gruElementWise
-				cudaStreamWaitEvent(stream, gemmGruHDone, 0);
-				gruElementWise KERNEL_ARGS4(dim3(batch_size * hidden.shape2 / 512 + 1), dim3(512), 0, stream) (
-					hidden.device,  // float* hidden
-					w_gru_x.device,  // float* W
-					w_gru_h.device,  // float* U
-					batch_size,  // int batch_size
-					hidden_size  // int hidden_size
-					);
-				cudaEventRecord(elementWiseDone, stream);
+		// out_x = hidden.dot(O1_W) + O1_b
+		cudaStreamWaitEvent(biasCopyStream, gemmO2Done, 0);
+		checkCudaErrors(cudaMemcpyAsync(w_out_x1.device, O1_b_b.device, max_batch_size * w_out_x1.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
+		cudaEventRecord(copyO1bDone, biasCopyStream);
 
-				// out_x = hidden.dot(O1_W) + O1_b
-				cudaStreamWaitEvent(biasCopyStream, gemmO2Done, 0);
-				checkCudaErrors(cudaMemcpyAsync(w_out_x1.device, O1_b_b.device, batch_size * w_out_x1.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-				cudaEventRecord(copyO1bDone, biasCopyStream);
+		cudaStreamWaitEvent(stream, copyO1bDone, 0);
+		checkCudaErrors(cublasSgemm(
+			cublasHandle, // cublasHandle_t handle,
+			CUBLAS_OP_N, // cublasOperation_t transa,
+			CUBLAS_OP_N, // cublasOperation_t transb,
+			O1_W.shape2, // int m,
+			max_batch_size, // int n,
+			O1_W.shape1, // int k,
+			&gemmAlpha, // const float *alpha, /* host or device pointer */
+			O1_W.device, // const float *A,
+			O1_W.shape2, // int lda,
+			hidden.device, // const float *B,
+			hidden.shape2, // int ldb,
+			&gemmBeta, // const float *beta, /* host or device pointer */
+			w_out_x1.device, // float *C,
+			w_out_x1.shape2 // int ldc
+		));
+		cudaEventRecord(gemmO1Done, stream);
 
-				cudaStreamWaitEvent(stream, copyO1bDone, 0);
-				checkCudaErrors(cublasSgemm(
-					cublasHandle, // cublasHandle_t handle,
-					CUBLAS_OP_N, // cublasOperation_t transa,
-					CUBLAS_OP_N, // cublasOperation_t transb,
-					O1_W.shape2, // int m,
-					batch_size, // int n,
-					O1_W.shape1, // int k,
-					&gemmAlpha, // const float *alpha, /* host or device pointer */
-					O1_W.device, // const float *A,
-					O1_W.shape2, // int lda,
-					hidden.device, // const float *B,
-					hidden.shape2, // int ldb,
-					&gemmBeta, // const float *beta, /* host or device pointer */
-					w_out_x1.device, // float *C,
-					w_out_x1.shape2 // int ldc
-				));
-				cudaEventRecord(gemmO1Done, stream);
+		// relu
+		relu KERNEL_ARGS4(dim3(max_batch_size * w_out_x1.shape2 / 512 + 1), dim3(512), 0, stream) (
+			w_out_x1.device,  // float* x
+			max_batch_size * w_out_x1.shape2  // int size
+			);
 
-				// relu
-				relu KERNEL_ARGS4(dim3(batch_size * w_out_x1.shape2 / 512 + 1), dim3(512), 0, stream) (
-					w_out_x1.device,  // float* x
-					batch_size * w_out_x1.shape2  // int size
-					);
+		// out_x = out_x.dot(O2_W) + O2_b
+		cudaStreamWaitEvent(biasCopyStream, argmaxDone, 0);
+		checkCudaErrors(cudaMemcpyAsync(w_out_x2.device, O2_b_b.device, max_batch_size * w_out_x2.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
+		cudaEventRecord(copyO2bDone, biasCopyStream);
 
-				// out_x = out_x.dot(O2_W) + O2_b
-				cudaStreamWaitEvent(biasCopyStream, argmaxDone, 0);
-				checkCudaErrors(cudaMemcpyAsync(w_out_x2.device, O2_b_b.device, batch_size * w_out_x2.shape2 * sizeof(float), cudaMemcpyDeviceToDevice, biasCopyStream));
-				cudaEventRecord(copyO2bDone, biasCopyStream);
+		cudaStreamWaitEvent(stream, copyO2bDone, 0);
+		checkCudaErrors(cublasSgemm(
+			cublasHandle, // cublasHandle_t handle,
+			CUBLAS_OP_N, // cublasOperation_t transa,
+			CUBLAS_OP_N, // cublasOperation_t transb,
+			O2_W.shape2, // int m,
+			max_batch_size, // int n,
+			O2_W.shape1, // int k,
+			&gemmAlpha, // const float *alpha, /* host or device pointer */
+			O2_W.device, // const float *A,
+			O2_W.shape2, // int lda,
+			w_out_x1.device, // const float *B,
+			w_out_x1.shape2, // int ldb,
+			&gemmBeta, // const float *beta, /* host or device pointer */
+			w_out_x2.device, // float *C,
+			w_out_x2.shape2 // int ldc
+		));
+		cudaEventRecord(gemmO2Done, stream);
 
-				cudaStreamWaitEvent(stream, copyO2bDone, 0);
-				checkCudaErrors(cublasSgemm(
-					cublasHandle, // cublasHandle_t handle,
-					CUBLAS_OP_N, // cublasOperation_t transa,
-					CUBLAS_OP_N, // cublasOperation_t transb,
-					O2_W.shape2, // int m,
-					batch_size, // int n,
-					O2_W.shape1, // int k,
-					&gemmAlpha, // const float *alpha, /* host or device pointer */
-					O2_W.device, // const float *A,
-					O2_W.shape2, // int lda,
-					w_out_x1.device, // const float *B,
-					w_out_x1.shape2, // int ldb,
-					&gemmBeta, // const float *beta, /* host or device pointer */
-					w_out_x2.device, // float *C,
-					w_out_x2.shape2 // int ldc
-				));
-				cudaEventRecord(gemmO2Done, stream);
+		// softmax
+		auto dist = w_out_x2;
+		float softmaxAlpha = 1, softmaxBeta = 0;
+		checkCudaErrors(cudnnSoftmaxForward(
+			cudnnHandle, // cudnnHandle_t
+			CUDNN_SOFTMAX_LOG, // cudnnSoftmaxAlgorithm_t
+			CUDNN_SOFTMAX_MODE_CHANNEL, // cudnnSoftmaxMode_t
+			&softmaxAlpha, // const void
+			softmaxDesc, // const cudnnTensorDescriptor_t
+			dist.device, // const void
+			&softmaxBeta, // const void
+			softmaxDesc, // const cudnnTensorDescriptor_t
+			dist.device // void
+		));
 
-				// softmax
-				auto dist = w_out_x2;
-				float softmaxAlpha = 1, softmaxBeta = 0;
-				checkCudaErrors(cudnnSoftmaxForward(
-					cudnnHandle, // cudnnHandle_t
-					CUDNN_SOFTMAX_LOG, // cudnnSoftmaxAlgorithm_t
-					CUDNN_SOFTMAX_MODE_CHANNEL, // cudnnSoftmaxMode_t
-					&softmaxAlpha, // const void
-					softmaxDesc, // const cudnnTensorDescriptor_t
-					dist.device, // const void
-					&softmaxBeta, // const void
-					softmaxDesc, // const cudnnTensorDescriptor_t
-					dist.device // void
-				));
+		// sampling
+		addGumbel KERNEL_ARGS4(dim3(max_batch_size * dist.shape2 / 512 + 1), dim3(512), 0, stream) (
+			dist.device,  // float *x
+			gumbel_random_state.device,  // curandState *state
+			max_batch_size * dist.shape2  // int size
+			);
 
-				// sampling
-				addGumbel KERNEL_ARGS4(dim3(batch_size * dist.shape2 / 512 + 1), dim3(512), 0, stream) (
-					dist.device,  // float *x
-					gumbel_random_state.device,  // curandState *state
-					batch_size * dist.shape2  // int size
-					);
+		checkCudaErrors(cub::DeviceSegmentedReduce::ArgMax(
+			argmax_storage.device,  // void *d_temp_storage
+			argmax_storage_bytes,  // size_t &temp_storage_bytes
+			dist.device,  // InputIteratorT d_in
+			w_sampled.device,  // OutputIteratorT d_out
+			max_batch_size,  // int num_segments
+			argmax_offset.device,  // OffsetIteratorT d_begin_offsets
+			argmax_offset.device + 1,  // OffsetIteratorT d_end_offsets
+			stream,  // cudaStream_t stream
+			false  // bool debug_synchronous
+		));
+		cudaEventRecord(argmaxDone, stream);
 
-				checkCudaErrors(cub::DeviceSegmentedReduce::ArgMax(
-					argmax_storage.device,  // void *d_temp_storage
-					argmax_storage_bytes,  // size_t &temp_storage_bytes
-					dist.device,  // InputIteratorT d_in
-					w_sampled.device,  // OutputIteratorT d_out
-					batch_size,  // int num_segments
-					argmax_offset.device,  // OffsetIteratorT d_begin_offsets
-					argmax_offset.device + 1,  // OffsetIteratorT d_end_offsets
-					stream,  // cudaStream_t stream
-					false  // bool debug_synchronous
-				));
-				cudaEventRecord(argmaxDone, stream);
+		cudaStreamWaitEvent(stream, outputCopyDone, 0);
+		pairToKey KERNEL_ARGS4(dim3(max_batch_size / 512 + 1), dim3(512), 0, stream) (
+			x.device,  // int *x
+			w_sampled.device,  // cub::KeyValuePair<int, float>* pair
+			max_batch_size  // int size
+			);
+		cudaEventRecord(toKeyDone, stream);
 
-				cudaStreamWaitEvent(stream, outputCopyDone, 0);
-				pairToKey KERNEL_ARGS4(dim3(batch_size / 512 + 1), dim3(512), 0, stream) (
-					x.device,  // int *x
-					w_sampled.device,  // cub::KeyValuePair<int, float>* pair
-					batch_size  // int size
-					);
-				cudaEventRecord(toKeyDone, stream);
-
-				cudaStreamWaitEvent(outputCopyStream, toKeyDone, 0);
-				cudaMemcpyAsync(&g_h_pinned_output[i_local * batch_size], x.device, batch_size * sizeof(int), cudaMemcpyDeviceToHost, outputCopyStream);
-				cudaEventRecord(outputCopyDone, outputCopyStream);
-			}
-
-			cudaMemcpyAsync(x.host, x.device, batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream);
-			cudaMemcpyAsync(hidden.host, hidden.device, batch_size * hidden.shape2 * sizeof(float), cudaMemcpyDeviceToHost, stream);
-
-			cudaStreamWaitEvent(stream, outputCopyDone, 0);
-
-			cudaGraph_t graph;
-			checkCudaErrors(cudaStreamEndCapture(stream, &graph));
-
-			checkCudaErrors(cudaGraphInstantiate(&g_graphExec[(batch_size - 1) * graph_length_num + i_graph_length], graph, NULL, NULL, 0));
-			
-			checkCudaErrors(cudaGraphDestroy(graph));
-			std::cout << "graph done" << batch_size << std::endl;
-
-			// destroy
-			checkCudaErrors(cudaEventDestroy(elementWiseDone));
-			checkCudaErrors(cudaEventDestroy(gemmO2Done));
-			checkCudaErrors(cudaEventDestroy(argmaxDone));
-			checkCudaErrors(cudaEventDestroy(copyGruXbDone));
-			checkCudaErrors(cudaEventDestroy(copyGruHbDone));
-			checkCudaErrors(cudaEventDestroy(copyO1bDone));
-			checkCudaErrors(cudaEventDestroy(copyO2bDone));
-			checkCudaErrors(cudaEventDestroy(gemmO1Done));
-			checkCudaErrors(cudaEventDestroy(gemmGruHDone));
-			checkCudaErrors(cudaEventDestroy(outputCopyDone));
-			checkCudaErrors(cudaEventDestroy(toKeyDone));
-		}
+		cudaStreamWaitEvent(outputCopyStream, toKeyDone, 0);
+		cudaMemcpyAsync(&g_h_pinned_output[i_local * max_batch_size], x.device, max_batch_size * sizeof(int), cudaMemcpyDeviceToHost, outputCopyStream);
+		cudaEventRecord(outputCopyDone, outputCopyStream);
 	}
+
+	cudaMemcpyAsync(x.host, x.device, max_batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream);
+	cudaMemcpyAsync(hidden.host, hidden.device, max_batch_size * hidden.shape2 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+
+	cudaStreamWaitEvent(stream, outputCopyDone, 0);
+
+	cudaGraph_t graph;
+	checkCudaErrors(cudaStreamEndCapture(stream, &graph));
+
+	checkCudaErrors(cudaGraphInstantiate(&g_graphExec, graph, NULL, NULL, 0));
+
+	checkCudaErrors(cudaGraphDestroy(graph));
+	std::cout << "graph done" << std::endl;
+
+	// destroy
+	checkCudaErrors(cudaEventDestroy(elementWiseDone));
+	checkCudaErrors(cudaEventDestroy(gemmO2Done));
+	checkCudaErrors(cudaEventDestroy(argmaxDone));
+	checkCudaErrors(cudaEventDestroy(copyGruXbDone));
+	checkCudaErrors(cudaEventDestroy(copyGruHbDone));
+	checkCudaErrors(cudaEventDestroy(copyO1bDone));
+	checkCudaErrors(cudaEventDestroy(copyO2bDone));
+	checkCudaErrors(cudaEventDestroy(gemmO1Done));
+	checkCudaErrors(cudaEventDestroy(gemmGruHDone));
+	checkCudaErrors(cudaEventDestroy(outputCopyDone));
+	checkCudaErrors(cudaEventDestroy(toKeyDone));
 
 	// destroy
 	checkCudaErrors(cudaStreamDestroy(biasCopyStream));
@@ -661,9 +607,7 @@ void initialize(
 
 	g_stream = stream;
 
-	g_graph_lengths = (int*)malloc(graph_length_num * sizeof(int));
-	memcpy(g_graph_lengths, graph_lengths, graph_length_num * sizeof(int));
-	g_graph_length_num = graph_length_num;
+	g_graph_length = graph_length;
 }
 
 
@@ -679,49 +623,45 @@ void inference(
 	std::chrono::system_clock::time_point start, end;
 	start = std::chrono::system_clock::now();
 
-	checkCudaErrors(cudaMemcpy(g_x.host, h_x, batch_size * sizeof(int), cudaMemcpyHostToHost));
-	checkCudaErrors(cudaMemcpy(g_hidden.host, h_hidden, batch_size * g_hidden.shape2 * sizeof(float), cudaMemcpyHostToHost));
+	checkCudaErrors(cudaMemcpyAsync(g_x.host, h_x, batch_size * sizeof(int), cudaMemcpyHostToHost, g_stream));
+	checkCudaErrors(cudaMemcpyAsync(g_hidden.host, h_hidden, batch_size * g_hidden.shape2 * sizeof(float), cudaMemcpyHostToHost, g_stream));
 
-	int max_graph_length = g_graph_lengths[0];
 	int l_size = batch_size * g_l_array.shape3;
+
+	int max_batch_size = g_l_array.shape2;
+	int g_l_size = g_l_array.shape2 * g_l_array.shape3;
 
 	int now_length = 0;
 	while (now_length < length) {
-		// choice graph length
-		int i_graph_length = 0;
-		for (; i_graph_length < g_graph_length_num; i_graph_length++) {
-			if (g_graph_lengths[i_graph_length] <= length - now_length) {
-				break;
-			}
-		}
+		// re-zero
+		checkCudaErrors(cudaMemsetAsync(g_l_array.host, 0, g_l_array.size(), g_stream));
 
+		// choice graph length
 		int next_length;
-		int pad_length;
-		if (i_graph_length < g_graph_length_num) {
-			next_length = g_graph_lengths[i_graph_length];
-			pad_length = 0;
+		if (length - now_length >= g_graph_length) {
+			next_length = g_graph_length;
 		}
 		else {
 			next_length = length - now_length;
-			pad_length = g_graph_lengths[g_graph_length_num - 1] - next_length;
-			checkCudaErrors(cudaMemset(&g_l_array.host[next_length * batch_size * g_l_array.shape3], 0, pad_length * batch_size * g_l_array.shape3));
-
-			i_graph_length--;
 		}
 
 		// forward
-		checkCudaErrors(cudaMemcpy(g_l_array.host, &h_l_array[now_length * l_size], (next_length + pad_length) * l_size * sizeof(float), cudaMemcpyHostToHost));
+		for (int i = 0; i < next_length; i++) {
+			checkCudaErrors(cudaMemcpyAsync(&g_l_array.host[i * g_l_size], &h_l_array[(now_length + i) * l_size], l_size * sizeof(float), cudaMemcpyHostToHost, g_stream));
+		}
 
-		checkCudaErrors(cudaGraphLaunch(g_graphExec[(batch_size - 1) * g_graph_length_num + i_graph_length], g_stream));
+		checkCudaErrors(cudaGraphLaunch(g_graphExec, g_stream));
 
-		checkCudaErrors(cudaMemcpy(&h_output[now_length * batch_size], g_h_pinned_output, next_length * batch_size * sizeof(int), cudaMemcpyHostToHost));
+		for (int i = 0; i < next_length; i++) {
+			checkCudaErrors(cudaMemcpyAsync(&h_output[(now_length + i) * batch_size], &g_h_pinned_output[i * max_batch_size], batch_size * sizeof(int), cudaMemcpyHostToHost, g_stream));
+		}
 
 		// next loop
 		now_length += next_length;
 	}
 
-	checkCudaErrors(cudaMemcpy(h_x, g_x.host, batch_size * sizeof(int), cudaMemcpyHostToHost));
-	checkCudaErrors(cudaMemcpy(h_hidden, g_hidden.host, batch_size * g_hidden.shape2 * sizeof(float), cudaMemcpyHostToHost));
+	checkCudaErrors(cudaMemcpyAsync(h_x, g_x.host, batch_size * sizeof(int), cudaMemcpyHostToHost, g_stream));
+	checkCudaErrors(cudaMemcpyAsync(h_hidden, g_hidden.host, batch_size * g_hidden.shape2 * sizeof(float), cudaMemcpyHostToHost, g_stream));
 
 	end = std::chrono::system_clock::now();
 

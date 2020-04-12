@@ -1,8 +1,7 @@
 #pragma once
 
 extern "C" __declspec(dllexport) void initialize(
-	int* graph_lengths,
-	int graph_length_num,
+	int graph_length,
 	int max_batch_size,
 	int local_size,
 	int hidden_size,
