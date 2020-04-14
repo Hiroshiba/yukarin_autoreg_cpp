@@ -1,6 +1,12 @@
 #pragma once
 
-extern "C" __declspec(dllexport) void initialize(
+#if defined(_WIN32) || defined(_WIN64)
+#define DllExport __declspec( dllexport )
+#else
+#define DllExport
+#endif
+
+extern "C" DllExport void initialize(
 	int graph_length,
 	int max_batch_size,
 	int local_size,
@@ -19,7 +25,7 @@ extern "C" __declspec(dllexport) void initialize(
 	float* h_O2_b
 );
 
-extern "C" __declspec(dllexport) void inference(
+extern "C" DllExport void inference(
 	int batch_size,
 	int length,
 	int* h_output,
