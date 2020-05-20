@@ -5,3 +5,10 @@
 Debug/
 Release/
 Releases/
+
+# visual studio code
+.vscode/
+
+# compiled objects
+*.o
+*.so
