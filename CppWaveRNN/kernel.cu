@@ -195,8 +195,17 @@ __global__ void initRandomState(curandState *state, int size) {
 	curand_init(i, 0, 0, &state[i]);
 }
 
+__global__ void floatToDouble(float *src, double *dst, int size)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= size)
+		return;
 
-__global__ void addGumbel(float *x, curandState *state, int size)
+	dst[i] = (double) src[i];
+}
+
+
+__global__ void addGumbel(double *x, curandState *state, int size)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= size) return;
@@ -205,7 +214,7 @@ __global__ void addGumbel(float *x, curandState *state, int size)
 }
 
 
-__global__ void pairToKey(int *x, cub::KeyValuePair<int, float>* pair, int size) {
+__global__ void pairToKey(int *x, cub::KeyValuePair<int, double>* pair, int size) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= size) return;
 
@@ -281,7 +290,8 @@ void initialize(
 	auto w_gru_h = ndarray<float>(max_batch_size, hidden_size * 3);
 	auto w_out_x1 = ndarray<float>(max_batch_size, linear_hidden_size);
 	auto w_out_x2 = ndarray<float>(max_batch_size, output_size);
-	auto w_sampled = ndarray<cub::KeyValuePair<int, float>>(max_batch_size);
+	auto w_dist = ndarray<double>(max_batch_size, output_size);
+	auto w_sampled = ndarray<cub::KeyValuePair<int, double>>(max_batch_size);
 
 	auto gumbel_random_state = ndarray<curandState>(max_batch_size, output_size);
 
@@ -377,7 +387,7 @@ void initialize(
 	checkCudaErrors(cudnnSetTensor4dDescriptor(
 		softmaxDesc,
 		CUDNN_TENSOR_NCHW,
-		CUDNN_DATA_FLOAT,
+		CUDNN_DATA_DOUBLE,
 		max_batch_size,
 		w_out_x2.shape2,
 		1,
@@ -521,32 +531,37 @@ void initialize(
 		));
 		cudaEventRecord(gemmO2Done, stream);
 
+		floatToDouble KERNEL_ARGS4(dim3(max_batch_size * w_out_x2.shape2 / 512 + 1), dim3(512), 0, stream) (
+			w_out_x2.device, // float *src
+			w_dist.device, // double *dst
+			max_batch_size * w_out_x2.shape2 // int size
+		);
+
 		// softmax
-		auto dist = w_out_x2;
-		float softmaxAlpha = 1, softmaxBeta = 0;
+		double softmaxAlpha = 1, softmaxBeta = 0;
 		checkCudaErrors(cudnnSoftmaxForward(
 			cudnnHandle, // cudnnHandle_t
 			CUDNN_SOFTMAX_LOG, // cudnnSoftmaxAlgorithm_t
 			CUDNN_SOFTMAX_MODE_CHANNEL, // cudnnSoftmaxMode_t
 			&softmaxAlpha, // const void
 			softmaxDesc, // const cudnnTensorDescriptor_t
-			dist.device, // const void
+			w_dist.device, // const void
 			&softmaxBeta, // const void
 			softmaxDesc, // const cudnnTensorDescriptor_t
-			dist.device // void
+			w_dist.device // void
 		));
 
 		// sampling
-		addGumbel KERNEL_ARGS4(dim3(max_batch_size * dist.shape2 / 512 + 1), dim3(512), 0, stream) (
-			dist.device,  // float *x
+		addGumbel KERNEL_ARGS4(dim3(max_batch_size * w_dist.shape2 / 512 + 1), dim3(512), 0, stream) (
+			w_dist.device,  // double *x
 			gumbel_random_state.device,  // curandState *state
-			max_batch_size * dist.shape2  // int size
+			max_batch_size * w_dist.shape2  // int size
 			);
 
 		checkCudaErrors(cub::DeviceSegmentedReduce::ArgMax(
 			argmax_storage.device,  // void *d_temp_storage
 			argmax_storage_bytes,  // size_t &temp_storage_bytes
-			dist.device,  // InputIteratorT d_in
+			w_dist.device,  // InputIteratorT d_in
 			w_sampled.device,  // OutputIteratorT d_out
 			max_batch_size,  // int num_segments
 			argmax_offset.device,  // OffsetIteratorT d_begin_offsets
@@ -559,7 +574,7 @@ void initialize(
 		cudaStreamWaitEvent(stream, outputCopyDone, 0);
 		pairToKey KERNEL_ARGS4(dim3(max_batch_size / 512 + 1), dim3(512), 0, stream) (
 			x.device,  // int *x
-			w_sampled.device,  // cub::KeyValuePair<int, float>* pair
+			w_sampled.device,  // cub::KeyValuePair<int, double>* pair
 			max_batch_size  // int size
 			);
 		cudaEventRecord(toKeyDone, stream);
