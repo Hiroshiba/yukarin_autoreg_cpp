@@ -14,7 +14,7 @@
 #include <util_type.cuh>
 #include <device_launch_parameters.h>
 
-#include "CppWaveRNN.h"
+#include "yukarin_autoreg_cpp.h"
 
 
 // CUDA Runtime error messages

@@ -238,7 +238,7 @@ all: build
 
 build: yukarin_autoreg_cpp.so
 
-yukarin_autoreg_cpp.o:kernel.cu
+yukarin_autoreg_cpp.o:yukarin_autoreg_cpp.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
 yukarin_autoreg_cpp.so: yukarin_autoreg_cpp.o
@@ -251,4 +251,4 @@ run: build
 
 clean:
 	rm -f yukarin_autoreg_cpp.so yukarin_autoreg_cpp.o
-	rm -rf bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)/libyukarin_autoreg_cpp.so
+	rm -rf bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)
